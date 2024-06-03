@@ -6,9 +6,24 @@ import pandas as pd
 from transformers import DataCollatorForLanguageModeling
 from torch.utils.data.dataset import Dataset
 from transformers import Trainer, TrainingArguments
+from accelerate import Accelerator
+from transformers import AdamW, get_linear_schedule_with_warmup
+from torch.utils.data import DataLoader
+import os
+import json
+import torch
 
 VOCAB_SIZE = 52000
 MAX_LEN = 512
+
+train_batch_size = 60
+eval_batch_size = 60
+learning_rate = 1e-4
+warmup_steps = 500
+num_epochs = 40
+gradient_accumulation_steps = 4
+checkpointing_steps == "epoch"
+output_dir = "RoBERTa"
 
 # Set a configuration for our RoBERTa model
 config = RobertaConfig(
@@ -28,74 +43,86 @@ tokenizer_folder = "tokenizer_S_b"
 tokenizer = RobertaTokenizerFast.from_pretrained(tokenizer_folder, max_len=MAX_LEN)
 
 
-dataset = load_dataset("spsither/tibetan_monolingual_S_cleaned_train_test", num_proc=23)
+# raw_dataset = load_dataset("spsither/tibetan_monolingual_S_cleaned_train_test", num_proc=23)
 
 
-class CustomDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_len=512):
-        self.df = pd.DataFrame(dataset["text"])
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+# Tokenize helper function
+# def tokenize(batch):
+# return tokenizer(batch['text'], padding='max_length', truncation=True, return_tensors="pt")
 
-    def __len__(self):
-        return self.df.shape[0]
+# Tokenize dataset
+# tokenized_dataset = raw_dataset.map(tokenize, batched=True, remove_columns=["text"])
 
-    def __getitem__(self, i):
-        inputs = self.tokenizer.encode_plus(
-            self.df.iloc[i, 0],
-            max_length=self.max_len,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
+tokenized_dataset = load_dataset(
+    "spsither/tibetan_monolingual_S_cleaned_train_test_tokenized", num_proc=23
+)
 
-        return {
-            "input_ids": inputs.input_ids[0],
-            "attention_mask": inputs.attention_mask[0],
-        }
-
-
-eval_dataset = CustomDataset(dataset["test"], tokenizer)
-
-train_dataset = CustomDataset(dataset["train"], tokenizer)
-
+# Initialize accelerator with bf16
+accelerator = Accelerator()  # mixed_precision="bf16")
+optimizer = AdamW(params=model.parameters(), lr=learning_rate)
 
 # Define the Data Collator
 data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer, mlm=True, mlm_probability=0.15
 )
 
-
-# Define the training arguments
-training_args = TrainingArguments(
-    output_dir="RoBERTa",
-    overwrite_output_dir=False,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    num_train_epochs=40,
-    learning_rate=1e-4,  # default: 0.001
-    warmup_steps=500,
-    weight_decay=0.01,
-    per_device_train_batch_size=60,  # 1-32 # 60-1gpu TTF # 30-1gpu FFF # 4-4gpus TTT
-    per_device_eval_batch_size=60,  # can be larger than per_device_train_batch_size, no need for grad
-    gradient_checkpointing=True,  # default False, try False
-    fp16=True,  # default False, try False
-    group_by_length=True,  # default False, try False # takes time
-    gradient_accumulation_steps=1,  # default 1
-    logging_strategy="steps",
-    logging_steps=100,
-    save_total_limit=40,
-    report_to=["wandb"],
+train_dataloader = DataLoader(
+    tokenized_dataset["train"],
+    shuffle=True,
+    batch_size=train_batch_size,
+    collate_fn=data_collator,
 )
-# Create the trainer for our model
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    data_collator=data_collator,
-    train_dataset=eval_dataset,
-    eval_dataset=eval_dataset,
-    # prediction_loss_only=True,
+eval_dataloader = DataLoader(
+    tokenized_dataset["test"],
+    shuffle=False,
+    batch_size=eval_batch_size,
+    collate_fn=data_collator,
 )
 
-# Train the model
-trainer.train()
+model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader
+)
+
+# Instantiate learning rate scheduler
+lr_scheduler = get_linear_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=len(train_dataloader) * num_epochs,
+)
+
+
+# Training loop
+for epoch in range(num_epochs):
+    model.train()
+    for step, batch in enumerate(train_dataloader):
+        outputs = model(**{k: v.to(model.device) for k, v in batch.items()})
+        loss = outputs.loss
+        loss = loss / gradient_accumulation_steps
+        accelerator.backward(loss)
+
+        if step % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+    # Evaluation step
+    model.eval()
+    eval_loss = 0
+    for step, batch in enumerate(eval_dataloader):
+        with torch.no_grad():
+            outputs = model(**{k: v.to(model.device) for k, v in batch.items()})
+            eval_loss += outputs.loss.detach()
+
+    eval_loss = eval_loss / len(eval_dataloader)
+    print(f"Validation Loss: {eval_loss}")
+
+    if checkpointing_steps == "epoch":
+        output_dir = os.path.join(output_dir, f"epoch_{epoch}")
+        accelerator.save_state(output_dir)
+
+# Save final model and results
+if output_dir is not None:
+    model.save_pretrained(output_dir, save_function=accelerator.save)
+    tokenizer.save_pretrained(output_dir)
+    with open(os.path.join(output_dir, "all_results.json"), "w") as f:
+        json.dump({"final_eval_loss": float(eval_loss)}, f)
